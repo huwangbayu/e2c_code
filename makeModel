@@ -1,0 +1,203 @@
+# -*- coding:utf-8 -*-
+from makeModelBasic import *
+from tensorflow.keras import layers
+import tensorflow.keras.backend as K
+from tensorflow.keras.models import Model
+import os
+import numpy as np
+
+
+def make_encode(input_shape, latent_dim):
+    # encode part
+    input_tensor = layers.Input(input_shape)
+    x = cov_block_bn_relu(x=input_tensor, filters=16, kernel_size=[3, 3, 3],
+                          strides=[2, 2, 2], padding="SAME", active="relu", name="conv_1")
+
+    print('encode output shape is ', K.int_shape(x))
+    x = cov_block(x=x, filters=32, kernel_size=[3, 3, 3],
+                          strides=[2, 2, 2], padding="SAME", active="relu", name="conv_2")
+
+    print('encode output shape is ', K.int_shape(x))
+    x = cov_block(x=x, filters=64, kernel_size=[3, 3, 3],
+                          strides=[2, 2, 2], padding="SAME", active="relu", name="conv_3")
+
+    print('encode output shape is ', K.int_shape(x))
+
+    x = densenet_block(x=x, blocks=3, filters=32, name="den1")
+    x1 = layers.Conv3D(filters=512, kernel_size=[1, 1, 1], strides=[1, 1, 1], padding="SAME", name="conv_5")(x)
+
+    print('encode x1 output shape is ', K.int_shape(x1))
+    x = layers.GlobalAveragePooling3D()(x1)
+
+    x = layers.Dense(latent_dim, kernel_initializer='glorot_normal', name="encode_dens_2")(x)
+
+    return Model(input_tensor, [x, x1], name='encoder')
+
+
+def make_trans(latent_dim, u_dim, dt_dim, pro_well_dim, pro_dim):
+    zt = layers.Input((latent_dim,))
+    ut = layers.Input((u_dim,))
+    dt = layers.Input((dt_dim,))
+    zt_dt = layers.Concatenate(axis=-1, name="zt_dt" + '_concat')([zt, dt])
+    hidden_dim = 256
+    x = fn_bn_relu(zt_dt, hidden_dim)
+    x = fn_bn_relu(x, hidden_dim)
+    x = fn_bn_relu(x, latent_dim)
+
+    At = layers.Dense(latent_dim * latent_dim)(x)
+    At = layers.Reshape((latent_dim, latent_dim))(At)
+
+    Bt = layers.Dense(latent_dim * u_dim)(x)
+    Bt = layers.Reshape((latent_dim, u_dim))(Bt)
+    # zt1 = At*zt + Bt*ut1
+    At_zt = layers.Lambda(lambda x: K.batch_dot(x[0], x[1]))([At, zt])
+    ut_dt = layers.Lambda(lambda x: x[0] * x[1])([ut, dt])
+    Bt_ut = layers.Lambda(lambda x: K.batch_dot(x[0], x[1]))([Bt, ut_dt])
+    zt1 = layers.add([At_zt, Bt_ut])
+    pro_rat = fn_bn_relu(zt1, 128)
+    # pro_rat = fn_bn_relu_pro(zt1, 128)
+    pro_rat = layers.Dense(pro_well_dim * pro_dim)(pro_rat)
+    pro_rat = layers.Reshape((pro_well_dim, pro_dim))(pro_rat)
+    print('trans output shape is ', K.int_shape(pro_rat))
+
+    return Model([zt, ut, dt], [zt1, pro_rat], name="trans")
+
+
+def make_decode(latent_dim, x1_shape, out_dim, padding1,padding2, padding3):
+    zt1 = layers.Input((latent_dim,))
+    x1 = layers.Input(x1_shape)
+    hid_dim = 512
+    x = layers.Dense(hid_dim, kernel_initializer='glorot_normal', name="dncode_dens_2")(zt1)
+    x = layers.Reshape([1, 1, 1, hid_dim])(x)
+
+    '''
+    hid_dim_z = 
+    
+    [0]
+    hid_dim_x = input_shape[1]
+    hid_dim_y = input_shape[2]
+
+    x = layers.RepeatVector(hid_dim_z*hid_dim_x*hid_dim_y)(x)
+    x = layers.Reshape([hid_dim_z, hid_dim_x, hid_dim_y, hid_dim])(x)
+    x = layers.concatenate([x, x1],axis=-1)
+    '''
+
+    x = layers.add([x, x1])
+    x = cov_block_bn_relu(x=x, filters=32, kernel_size=[1, 1, 1],
+                          strides=[1, 1, 1], padding="SAME", active="relu", name="tran_conv_1")
+    x = densenet_block(x=x, blocks=2, filters=32, name="den1")
+    print(x.shape)
+    '''
+    x = layers.Conv3DTranspose(filters=64,kernel_size=(3, 3, 3),padding="SAME")(x)
+    # print('decode1 output shape is ', K.int_shape(x))
+    '''
+    x = dconv_bn_nolinear_new(x=x, nb_filter=64, kernel_size=(3, 3, 3), name="padding1",
+                              padding=padding1,
+                              stride=(2, 2, 2))
+
+    print('decode1 output shape is ', K.int_shape(x))
+
+    x = dconv_bn_nolinear_new(x=x, nb_filter=32, kernel_size=(3, 3, 3), name="padding2",
+                              padding=padding2,
+                              stride=(2, 2, 2))
+    print('decode1 output shape is ', K.int_shape(x))
+
+    x = dconv_bn_nolinear_new(x=x, nb_filter=16, kernel_size=(3, 3, 3), name="padding3",
+                              padding=padding3,
+                              stride=(2, 2, 2))
+    print('decode1 output shape is ', K.int_shape(x))
+    y = layers.Conv3D(out_dim, (3, 3, 3), padding='same', activation=None)(x)
+    print('decode output shape is ', K.int_shape(y))
+    return Model([zt1, x1], y, name="decode")
+
+
+def create_e2c(input_shape, x1_shape, latent_dim, u_dim, dt_dim, pro_well_dim, pro_dim, out_dim, pad1, pad2, pad3):
+    encoder_ = make_encode(input_shape, latent_dim)
+    decoder_ = make_decode(latent_dim, x1_shape, out_dim, pad1, pad2, pad3)
+    transition_ = make_trans(latent_dim, u_dim, dt_dim, pro_well_dim, pro_dim)
+
+    return encoder_, decoder_, transition_
+
+
+class E2C(Model):
+    def __init__(self, input_shape, x1_shape, latent_dim, u_dim, dt_dim, pro_well_dim, pro_dim, out_dim, pad1, pad2,
+                 pad3):
+        super(E2C, self).__init__()
+        self._build_model(input_shape, x1_shape, latent_dim, u_dim, dt_dim, pro_well_dim, pro_dim, out_dim, pad1, pad2,
+                          pad3)
+
+    def _build_model(self, input_shape, x1_shape, latent_dim, u_dim, dt_dim, pro_well_dim, pro_dim, out_dim, pad1, pad2,
+                     pad3):
+        self.encoder, self.decoder, self.transition = create_e2c(input_shape, x1_shape, latent_dim,
+                                                                 u_dim, dt_dim, pro_well_dim, pro_dim, out_dim, pad1,
+                                                                 pad2, pad3)
+
+    def call(self, inputs):
+        self.xt, self.ut, self.dt = inputs
+        self.zt, self.x_encode_t = self.encoder(self.xt)
+        self.zt1_pre, self.pro_info_data = self.transition([self.zt, self.ut, self.dt])
+        self.xt1_pre = self.decoder([self.zt1_pre, self.x_encode_t])
+        return self.xt1_pre, self.pro_info_data
+
+    def loadWeightsFromFile(self, encoder_file, decoder_file, transition_file):
+        self.encoder.load_weights(encoder_file)
+        self.decoder.load_weights(decoder_file)
+        self.transition.load_weights(transition_file)
+
+    def saveWeightsToFile(self, encoder_file, decoder_file, transition_file):
+        self.encoder.save_weights(encoder_file)
+        self.decoder.save_weights(decoder_file)
+        self.transition.save_weights(transition_file)
+
+
+if __name__ == '__main__':
+    # make train param
+    import math
+
+    pro_well_dim = 1
+    u_dim = pro_well_dim
+    dt_dim = 1
+    latent_dim = 512
+    dx, dy, dz = 176, 41, 45
+    encoder_dim = 1024
+    out_dim =2
+    pro_well_dim = 3
+
+    input_shape = (dz, dy, dx, 2)
+    encode1_z = math.ceil(dz / 2)
+    encode1_y = math.ceil(dy / 2)
+    encode1_x = math.ceil(dx / 2)
+
+    encode2_z = math.ceil(encode1_z / 2)
+    encode2_y = math.ceil(encode1_y / 2)
+    encode2_x = math.ceil(encode1_x / 2)
+
+    encode3_z = math.ceil(encode2_z / 2)
+    encode3_y = math.ceil(encode2_y / 2)
+    encode3_x = math.ceil(encode2_x / 2)
+
+    x1_shape = (encode3_z, encode3_y, encode3_x, encoder_dim)
+
+    print(x1_shape)
+
+    padding3 = (int(not (dz % 2)), 1, int(not (dy % 2)), 1, int(not (dx % 2)), 1)
+    padding2 = (int(not (encode1_z % 2)), 1, int(not (encode1_y % 2)), 1, int(not (encode1_x % 2)), 1)
+    padding1 = (int(not (encode2_z % 2)), 1, int(not (encode2_y % 2)), 1, int(not (encode2_x % 2)), 1)
+    print(padding1, padding2, padding3)
+
+
+    model_test = E2C(input_shape, x1_shape, latent_dim, u_dim, dt_dim, pro_well_dim,pro_well_dim, out_dim, padding1, padding2, padding3)
+    # model_test.encoder.summary(positions=[.40, .65, .67, 1.])
+
+    # maker mode input
+    # @tf.function
+    def make_all_model():
+        xt = layers.Input(input_shape)
+        ut = layers.Input((u_dim,))
+        dt = layers.Input((dt_dim,))
+        inputs = (xt, ut, dt)
+        xt1_pre, x_pro_well = model_test(inputs)
+        return Model([xt, ut, dt], [xt1_pre, x_pro_well])
+
+    model = make_all_model()
+    model.summary(positions=[.40, .65, .67, 1.])
